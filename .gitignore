@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Downloader output and runtime diagnostics
+/[0-9][0-9][0-9][0-9]/
+/download-*-diagnostics*.log
