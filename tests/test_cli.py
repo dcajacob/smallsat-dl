@@ -7,6 +7,7 @@ from rich.console import Console
 
 import smallsat_dl.cli as cli
 from smallsat_dl.cli import (
+    defaults_to_latest,
     normalize_requested_years,
     parse_year_list,
     prompt_for_years,
@@ -16,6 +17,7 @@ from smallsat_dl.cli import (
 
 def args(**overrides):
     values = {
+        "interactive": False,
         "latest": False,
         "years": None,
         "all": False,
@@ -44,13 +46,21 @@ def test_range_can_be_supplied_in_either_order():
     ) == [2025, 2024, 2023]
 
 
-def test_no_selector_returns_none_for_interactive_prompt():
+def test_no_selector_defaults_to_latest():
+    assert defaults_to_latest(args())
     assert selected_years_from_args(args(), [2024, 2025]) is None
+
+
+def test_interactive_disables_latest_default():
+    assert not defaults_to_latest(args(interactive=True))
 
 
 def test_multiple_selectors_are_rejected():
     with pytest.raises(ValueError, match="choose only one"):
         selected_years_from_args(args(latest=True, years=[2025]), [2025])
+
+    with pytest.raises(ValueError, match="choose only one"):
+        selected_years_from_args(args(interactive=True, latest=True), [2025])
 
 
 def test_unavailable_years_are_rejected():

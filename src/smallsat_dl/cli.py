@@ -34,6 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="download the newest archive year containing at least one paper PDF",
     )
     parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="prompt for latest, specific years, a range, or all years",
+    )
+    parser.add_argument(
         "--year",
         action="append",
         type=int,
@@ -113,9 +118,23 @@ def selected_years_from_args(args: argparse.Namespace, available_years: list[int
     return None
 
 
+def defaults_to_latest(args: argparse.Namespace) -> bool:
+    return not any(
+        [
+            args.interactive,
+            args.latest,
+            args.years,
+            args.all,
+            args.from_year is not None,
+            args.to_year is not None,
+        ]
+    )
+
+
 def validate_year_selector_shape(args: argparse.Namespace) -> None:
     selector_count = sum(
         [
+            bool(args.interactive),
             bool(args.latest),
             bool(args.years),
             bool(args.all),
@@ -123,7 +142,10 @@ def validate_year_selector_shape(args: argparse.Namespace) -> None:
         ]
     )
     if selector_count > 1:
-        raise ValueError("choose only one year selector: --latest, --year, --from-year/--to-year, or --all")
+        raise ValueError(
+            "choose only one year selector: --latest, --interactive, --year, "
+            "--from-year/--to-year, or --all"
+        )
 
     if args.from_year is None and args.to_year is not None:
         raise ValueError("--to-year requires --from-year")
@@ -252,7 +274,7 @@ async def _run_downloader(
 ) -> int:
     try:
         validate_year_selector_shape(args)
-        if args.latest:
+        if args.latest or defaults_to_latest(args):
             latest_year = await search_archive(
                 "Searching for the latest year containing a paper PDF...",
                 downloader.discover_latest_year,
@@ -264,7 +286,7 @@ async def _run_downloader(
                 downloader.discover_available_years,
             )
             years = selected_years_from_args(args, available_years)
-        if years is None:
+        if args.interactive:
             latest_year = await search_archive(
                 "Finding the newest archive year containing a paper PDF...",
                 downloader.discover_latest_year,
