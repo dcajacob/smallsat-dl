@@ -3,22 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from dataclasses import dataclass, field
 import datetime as dt
-from pathlib import Path
 import random
 import re
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup
 import httpx
+from aiolimiter import AsyncLimiter
+from bs4 import BeautifulSoup
 
 from .paths import paper_path, presentation_path, session_dir
 
 DEFAULT_BASE_URL = "https://digitalcommons.usu.edu/smallsat/"
 YEAR_RE = re.compile(r"/smallsat/(\d{4})/")
 ProgressCallback = Callable[[str, int, int], None]
+DiagnosticCallback = Callable[[str, dict[str, Any]], None]
 RETRYABLE_DOWNLOAD_STATUSES = {403, 429, 500, 502, 503, 504}
 
 
@@ -32,59 +36,6 @@ def is_retryable_download_error(exc: BaseException) -> bool:
     )
 
 
-class AdaptiveConcurrencyLimiter:
-    def __init__(
-        self,
-        maximum: int,
-        *,
-        increase_after: int = 12,
-        decrease_cooldown: float = 2.0,
-        on_change: Callable[[int, str], None] | None = None,
-    ) -> None:
-        self.maximum = maximum
-        self.limit = maximum
-        self.increase_after = increase_after
-        self.decrease_cooldown = decrease_cooldown
-        self.on_change = on_change
-        self._active = 0
-        self._successes = 0
-        self._last_decrease = float("-inf")
-        self._condition = asyncio.Condition()
-
-    async def acquire(self) -> None:
-        async with self._condition:
-            await self._condition.wait_for(lambda: self._active < self.limit)
-            self._active += 1
-
-    async def release(self) -> None:
-        async with self._condition:
-            self._active -= 1
-            self._condition.notify_all()
-
-    async def record_success(self) -> None:
-        async with self._condition:
-            self._successes += 1
-            if self.limit < self.maximum and self._successes >= self.increase_after:
-                self.limit += 1
-                self._successes = 0
-                self._condition.notify_all()
-                if self.on_change is not None:
-                    self.on_change(self.limit, "increase")
-
-    async def record_rate_limit(self) -> None:
-        now = asyncio.get_running_loop().time()
-        async with self._condition:
-            if now - self._last_decrease < self.decrease_cooldown:
-                return
-            new_limit = max(1, self.limit // 2)
-            self._last_decrease = now
-            self._successes = 0
-            if new_limit != self.limit:
-                self.limit = new_limit
-                if self.on_change is not None:
-                    self.on_change(self.limit, "decrease")
-
-
 @dataclass(frozen=True)
 class Link:
     title: str
@@ -94,7 +45,6 @@ class Link:
 @dataclass(frozen=True)
 class EventDetail:
     title: str
-    page_url: str
     pdf_url: str | None
     presentation_url: str | None
 
@@ -119,12 +69,11 @@ class DownloadFailure:
 
 @dataclass
 class DownloadStats:
+    file_targets: int = 0
     downloaded: int = 0
     skipped: int = 0
     dry_run: int = 0
     unavailable: int = 0
-    retryable_errors: int = 0
-    rate_limits: int = 0
     first_pass_rate_limits: int = 0
     retry_rate_limits: int = 0
     first_pass_downloaded: int = 0
@@ -136,13 +85,12 @@ class DownloadStats:
     retry_rounds: int = 0
     failures: list[DownloadFailure] = field(default_factory=list)
 
-    def extend(self, other: "DownloadStats") -> None:
+    def extend(self, other: DownloadStats) -> None:
+        self.file_targets += other.file_targets
         self.downloaded += other.downloaded
         self.skipped += other.skipped
         self.dry_run += other.dry_run
         self.unavailable += other.unavailable
-        self.retryable_errors += other.retryable_errors
-        self.rate_limits += other.rate_limits
         self.first_pass_rate_limits += other.first_pass_rate_limits
         self.retry_rate_limits += other.retry_rate_limits
         self.first_pass_downloaded += other.first_pass_downloaded
@@ -255,7 +203,16 @@ def parse_event_links(html: str, base_url: str) -> list[Link]:
     return events
 
 
-def parse_event_detail(html: str, base_url: str, fallback_title: str, page_url: str) -> EventDetail:
+def resolve_event_session(
+    source_session: Link,
+    event: Link,
+    sessions_by_url: dict[str, Link],
+) -> Link:
+    event_parent_url = event.url.rstrip("/").rsplit("/", 1)[0]
+    return sessions_by_url.get(event_parent_url, source_session)
+
+
+def parse_event_detail(html: str, base_url: str, fallback_title: str) -> EventDetail:
     soup = BeautifulSoup(html, "html.parser")
     pdf_anchor = soup.find("a", id="pdf", href=True)
     files = soup.find("div", class_="files")
@@ -263,7 +220,6 @@ def parse_event_detail(html: str, base_url: str, fallback_title: str, page_url: 
 
     return EventDetail(
         title=fallback_title,
-        page_url=page_url,
         pdf_url=urljoin(base_url, pdf_anchor["href"]) if pdf_anchor is not None else None,
         presentation_url=(
             urljoin(base_url, presentation_anchor["href"])
@@ -280,39 +236,36 @@ class SmallSatDownloader:
         client: HttpClient | None = None,
         base_url: str = DEFAULT_BASE_URL,
         delay: float = 0.25,
-        download_delay: float = 1.0,
+        downloads_per_minute: float = 15.0,
         concurrency: int = 8,
-        download_concurrency: int = 1,
-        retry_rounds: int = 5,
+        retry_rounds: int = 20,
         retry_backoff: float = 60.0,
         log: Callable[[str], None] = print,
         progress: ProgressCallback | None = None,
+        diagnostic: DiagnosticCallback | None = None,
     ) -> None:
         if concurrency < 1:
             raise ValueError("concurrency must be at least 1")
-        if download_concurrency < 1:
-            raise ValueError("download concurrency must be at least 1")
         if retry_rounds < 0:
             raise ValueError("retry rounds must be zero or greater")
-        if download_delay < 0:
-            raise ValueError("download delay must be zero or greater")
+        if downloads_per_minute <= 0:
+            raise ValueError("downloads per minute must be greater than zero")
         if retry_backoff < 0:
             raise ValueError("retry backoff must be zero or greater")
         self._owns_client = client is None
         self.client = client or HttpClient()
         self.base_url = base_url.rstrip("/") + "/"
         self.delay = delay
-        self.download_delay = download_delay
+        self.downloads_per_minute = downloads_per_minute
         self.retry_backoff = retry_backoff
         self._semaphore = asyncio.Semaphore(concurrency)
         self.log = log
         self.progress = progress
-        self._download_limiter = AdaptiveConcurrencyLimiter(
-            download_concurrency,
-            on_change=self._report_download_concurrency,
-        )
-        self._download_worker_count = download_concurrency
+        self.diagnostic = diagnostic
+        self._download_lock = asyncio.Lock()
+        self._download_meter = AsyncLimiter(1, 60.0 / downloads_per_minute)
         self._max_retry_rounds = retry_rounds
+        self._download_circuit_error: BaseException | None = None
 
     async def close(self) -> None:
         if self._owns_client:
@@ -357,46 +310,87 @@ class SmallSatDownloader:
     async def download_year(
         self, year: int, output_dir: Path, *, dry_run: bool = False
     ) -> DownloadStats:
+        year_started = time.monotonic()
         stats = DownloadStats()
         year_url = urljoin(self.base_url, f"{year}/")
         self.log(f"Year {year}")
+        self._diagnose(
+            "year_start",
+            year=year,
+            output_dir=str(output_dir),
+            dry_run=dry_run,
+        )
 
         try:
             year_html = await self._get_text(year_url)
             sessions = prefer_categorized_sessions(parse_session_links(year_html, year_url))
         except Exception as exc:  # noqa: BLE001 - keep crawling other requested years.
             stats.failures.append(DownloadFailure(year_url, str(exc)))
+            self._diagnose("year_page_failed", year=year, url=year_url, error=repr(exc))
             return stats
 
+        sessions_started = time.monotonic()
         session_results = await asyncio.gather(
             *(self._load_session(session) for session in sessions),
             return_exceptions=True,
         )
         event_jobs: list[tuple[Link, Link]] = []
         seen_event_urls: set[str] = set()
-        for session, result in zip(sessions, session_results, strict=True):
+        seen_event_destinations: set[Path] = set()
+        sessions_by_url = {session.url.rstrip("/"): session for session in sessions}
+        for source_session, result in zip(sessions, session_results, strict=True):
             if isinstance(result, BaseException):
-                stats.failures.append(DownloadFailure(session.url, str(result)))
+                stats.failures.append(DownloadFailure(source_session.url, str(result)))
                 continue
-            session_path = session_dir(output_dir, year, session.title)
+            session_path = session_dir(output_dir, year, source_session.title)
             session_path.mkdir(parents=True, exist_ok=True)
             (session_path / "presentations").mkdir(parents=True, exist_ok=True)
             for event in result:
                 if event.url in seen_event_urls:
                     continue
                 seen_event_urls.add(event.url)
-                event_jobs.append((session, event))
+                owner_session = resolve_event_session(
+                    source_session,
+                    event,
+                    sessions_by_url,
+                )
+                destination = paper_path(
+                    output_dir,
+                    year,
+                    owner_session.title,
+                    event.title,
+                )
+                if destination in seen_event_destinations:
+                    self._diagnose(
+                        "duplicate_event_destination",
+                        event_url=event.url,
+                        destination=str(destination),
+                    )
+                    continue
+                seen_event_destinations.add(destination)
+                event_jobs.append((owner_session, event))
 
         total_events = len(event_jobs)
         self.log(f"  Found {len(sessions)} sessions and {total_events} unique papers")
+        self._diagnose(
+            "sessions_loaded",
+            year=year,
+            session_count=len(sessions),
+            event_count=total_events,
+            failed_sessions=sum(
+                isinstance(result, BaseException) for result in session_results
+            ),
+            duration_seconds=round(time.monotonic() - sessions_started, 6),
+        )
         if total_events:
             self._report_progress("Inspecting paper pages...", 0, total_events)
 
+        details_started = time.monotonic()
         detail_results = await asyncio.gather(
             *(self._load_event_detail(event) for _, event in event_jobs),
             return_exceptions=True,
         )
-        download_queue: asyncio.Queue[tuple[Link, Link, EventDetail]] = asyncio.Queue()
+        download_events: list[tuple[Link, Link, EventDetail]] = []
         deferred_downloads: list[DeferredDownload] = []
         completed = 0
         for (session, event), result in zip(event_jobs, detail_results, strict=True):
@@ -406,39 +400,53 @@ class SmallSatDownloader:
                 completed += 1
                 self._report_progress(event.title, completed, total_events)
                 continue
-            if result.pdf_url is None:
+            if result.pdf_url is None and result.presentation_url is None:
                 stats.unavailable += 1
                 completed += 1
                 self._report_progress(event.title, completed, total_events)
                 continue
-            download_queue.put_nowait((session, event, result))
+            download_events.append((session, event, result))
 
-        async def download_worker() -> None:
-            nonlocal completed
-            while True:
-                try:
-                    session, event, detail = download_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                event_stats, event_deferred = await self._download_event_files(
-                    year,
-                    session,
-                    detail,
-                    output_dir,
-                    dry_run=dry_run,
-                )
-                stats.extend(event_stats)
-                deferred_downloads.extend(event_deferred)
-                download_queue.task_done()
-                completed += 1
-                self._report_progress(event.title, completed, total_events)
+        self._diagnose(
+            "event_details_loaded",
+            year=year,
+            requested=total_events,
+            queued=len(download_events),
+            unavailable=stats.unavailable,
+            failures=stats.first_pass_failures,
+            duration_seconds=round(time.monotonic() - details_started, 6),
+        )
+        self._diagnose(
+            "first_pass_start",
+            year=year,
+            queued_events=len(download_events),
+        )
+        self._download_circuit_error = None
 
-        workers = [
-            asyncio.create_task(download_worker())
-            for _ in range(min(self._download_worker_count, download_queue.qsize()))
-        ]
-        if workers:
-            await asyncio.gather(*workers)
+        for session, event, detail in download_events:
+            event_stats, event_deferred = await self._download_event_files(
+                year,
+                session,
+                detail,
+                output_dir,
+                dry_run=dry_run,
+            )
+            stats.extend(event_stats)
+            deferred_downloads.extend(event_deferred)
+            completed += 1
+            self._report_progress(event.title, completed, total_events)
+            self._diagnose(
+                "event_files_complete",
+                year=year,
+                event_url=event.url,
+                title=event.title,
+                completed=completed,
+                total=total_events,
+                downloaded=event_stats.downloaded,
+                skipped=event_stats.skipped,
+                deferred=len(event_deferred),
+                failures=len(event_stats.failures),
+            )
 
         self.log(
             "  First pass complete: "
@@ -447,8 +455,33 @@ class SmallSatDownloader:
             f"{stats.first_pass_deferred} deferred, "
             f"{stats.first_pass_failures} failed"
         )
+        self._diagnose(
+            "first_pass_complete",
+            year=year,
+            downloaded=stats.first_pass_downloaded,
+            skipped=stats.skipped,
+            deferred=stats.first_pass_deferred,
+            failures=stats.first_pass_failures,
+            rate_limits=stats.first_pass_rate_limits,
+            elapsed_seconds=round(time.monotonic() - year_started, 6),
+        )
         await self._retry_deferred_downloads(deferred_downloads, stats)
 
+        self._diagnose(
+            "year_complete",
+            year=year,
+            downloaded=stats.downloaded,
+            skipped=stats.skipped,
+            unavailable=stats.unavailable,
+            failures=len(stats.failures),
+            first_pass_deferred=stats.first_pass_deferred,
+            retry_recovered=stats.retry_recovered,
+            retry_exhausted=stats.retry_exhausted,
+            first_pass_rate_limits=stats.first_pass_rate_limits,
+            retry_rate_limits=stats.retry_rate_limits,
+            retry_rounds=stats.retry_rounds,
+            elapsed_seconds=round(time.monotonic() - year_started, 6),
+        )
         return stats
 
     async def _load_session(self, session: Link) -> list[Link]:
@@ -457,7 +490,7 @@ class SmallSatDownloader:
 
     async def _load_event_detail(self, event: Link) -> EventDetail:
         event_html = await self._get_text(event.url)
-        return parse_event_detail(event_html, event.url, event.title, event.url)
+        return parse_event_detail(event_html, event.url, event.title)
 
     async def _download_event_files(
         self,
@@ -470,12 +503,16 @@ class SmallSatDownloader:
     ) -> tuple[DownloadStats, list[DeferredDownload]]:
         stats = DownloadStats()
         deferred: list[DeferredDownload] = []
-        downloads = [
-            DownloadJob(
-                detail.pdf_url,
-                paper_path(output_dir, year, session.title, detail.title),
+        downloads: list[DownloadJob] = []
+        if detail.pdf_url is not None:
+            downloads.append(
+                DownloadJob(
+                    detail.pdf_url,
+                    paper_path(output_dir, year, session.title, detail.title),
+                )
             )
-        ]
+        if detail.pdf_url is None and detail.presentation_url is not None:
+            stats.unavailable += 1
         if detail.presentation_url is not None:
             downloads.append(
                 DownloadJob(
@@ -483,8 +520,23 @@ class SmallSatDownloader:
                     presentation_path(output_dir, year, session.title, detail.title),
                 )
             )
+        stats.file_targets = len(downloads)
 
         for job in downloads:
+            if self._download_circuit_error is not None:
+                stats.first_pass_deferred += 1
+                deferred.append(
+                    DeferredDownload(job, self._download_circuit_error)
+                )
+                self._diagnose(
+                    "download_deferred",
+                    phase="first_pass",
+                    reason="rate_limit_circuit_open",
+                    url=job.url,
+                    destination=str(job.destination),
+                    status_code=self._status_code(self._download_circuit_error),
+                )
+                continue
             try:
                 await self._download_once(
                     job,
@@ -496,9 +548,25 @@ class SmallSatDownloader:
                 if is_retryable_download_error(exc):
                     stats.first_pass_deferred += 1
                     deferred.append(DeferredDownload(job, exc))
+                    self._diagnose(
+                        "download_deferred",
+                        phase="first_pass",
+                        url=job.url,
+                        destination=str(job.destination),
+                        status_code=self._status_code(exc),
+                        error=repr(exc),
+                    )
                 else:
                     stats.first_pass_failures += 1
                     stats.failures.append(DownloadFailure(job.url, str(exc)))
+                    self._diagnose(
+                        "download_failed",
+                        phase="first_pass",
+                        url=job.url,
+                        destination=str(job.destination),
+                        status_code=self._status_code(exc),
+                        error=repr(exc),
+                    )
 
         return stats, deferred
 
@@ -512,14 +580,34 @@ class SmallSatDownloader:
     ) -> None:
         if job.destination.exists():
             stats.skipped += 1
+            self._diagnose(
+                "download_skipped",
+                phase="retry" if retry_phase else "first_pass",
+                url=job.url,
+                destination=str(job.destination),
+                existing_bytes=job.destination.stat().st_size,
+            )
             return
 
         if dry_run:
             stats.dry_run += 1
+            self._diagnose(
+                "download_dry_run",
+                phase="retry" if retry_phase else "first_pass",
+                url=job.url,
+                destination=str(job.destination),
+            )
             return
 
         if retry_phase:
             stats.retry_attempts += 1
+        started = time.monotonic()
+        self._diagnose(
+            "download_start",
+            phase="retry" if retry_phase else "first_pass",
+            url=job.url,
+            destination=str(job.destination),
+        )
         job.destination.parent.mkdir(parents=True, exist_ok=True)
         content = await self._get_bytes_once(
             job.url,
@@ -532,6 +620,14 @@ class SmallSatDownloader:
             stats.retry_recovered += 1
         else:
             stats.first_pass_downloaded += 1
+        self._diagnose(
+            "download_complete",
+            phase="retry" if retry_phase else "first_pass",
+            url=job.url,
+            destination=str(job.destination),
+            bytes=len(content),
+            duration_seconds=round(time.monotonic() - started, 6),
+        )
 
     async def _retry_deferred_downloads(
         self,
@@ -541,52 +637,77 @@ class SmallSatDownloader:
         pending = deferred
         for round_number in range(1, self._max_retry_rounds + 1):
             if not pending:
+                self._report_progress("Complete", 1, 1)
                 return
 
-            delay = min(
-                600.0,
-                self.retry_backoff * (2 ** (round_number - 1)),
-            ) * random.uniform(0.75, 1.25)
+            delay = self._retry_round_delay()
             self.log(
                 f"  Retry round {round_number}: "
                 f"{len(pending)} deferred file(s), waiting {delay:.1f}s"
             )
-            await asyncio.sleep(delay)
+            self._diagnose(
+                "retry_round_wait",
+                round=round_number,
+                pending=len(pending),
+                delay_seconds=round(delay, 6),
+            )
+            await self._wait_for_retry_round(delay, round_number, len(pending))
 
-            queue: asyncio.Queue[DeferredDownload] = asyncio.Queue()
-            for item in pending:
-                queue.put_nowait(item)
             next_pending: list[DeferredDownload] = []
             recovered_before = stats.retry_recovered
+            round_started = time.monotonic()
+            self._download_circuit_error = None
+            self._diagnose(
+                "retry_round_start",
+                round=round_number,
+                pending=len(pending),
+            )
 
-            async def retry_worker() -> None:
-                while True:
-                    try:
-                        item = queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        return
-                    try:
-                        await self._download_once(
-                            item.job,
-                            stats,
-                            dry_run=False,
-                            retry_phase=True,
+            for item in pending:
+                if self._download_circuit_error is not None:
+                    next_pending.append(
+                        DeferredDownload(item.job, self._download_circuit_error)
+                    )
+                    self._diagnose(
+                        "download_deferred",
+                        phase=f"retry_round_{round_number}",
+                        reason="rate_limit_circuit_open",
+                        url=item.job.url,
+                        destination=str(item.job.destination),
+                        status_code=self._status_code(
+                            self._download_circuit_error
+                        ),
+                    )
+                    continue
+                try:
+                    await self._download_once(
+                        item.job,
+                        stats,
+                        dry_run=False,
+                        retry_phase=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - classify for the next round.
+                    if is_retryable_download_error(exc):
+                        next_pending.append(DeferredDownload(item.job, exc))
+                        self._diagnose(
+                            "download_deferred",
+                            phase=f"retry_round_{round_number}",
+                            url=item.job.url,
+                            destination=str(item.job.destination),
+                            status_code=self._status_code(exc),
+                            error=repr(exc),
                         )
-                    except Exception as exc:  # noqa: BLE001 - classify for the next round.
-                        if is_retryable_download_error(exc):
-                            next_pending.append(DeferredDownload(item.job, exc))
-                        else:
-                            stats.retry_exhausted += 1
-                            stats.failures.append(DownloadFailure(item.job.url, str(exc)))
-                    finally:
-                        queue.task_done()
-
-            workers = [
-                asyncio.create_task(retry_worker())
-                for _ in range(min(self._download_worker_count, queue.qsize()))
-            ]
-            if workers:
-                await asyncio.gather(*workers)
+                    else:
+                        stats.retry_exhausted += 1
+                        stats.failures.append(DownloadFailure(item.job.url, str(exc)))
+                        self._diagnose(
+                            "download_failed",
+                            phase=f"retry_round_{round_number}",
+                            url=item.job.url,
+                            destination=str(item.job.destination),
+                            status_code=self._status_code(exc),
+                            error=repr(exc),
+                        )
 
             stats.retry_rounds = round_number
             recovered = stats.retry_recovered - recovered_before
@@ -594,11 +715,46 @@ class SmallSatDownloader:
                 f"  Retry round {round_number} complete: "
                 f"{recovered} recovered, {len(next_pending)} still deferred"
             )
+            self._diagnose(
+                "retry_round_complete",
+                round=round_number,
+                attempted=len(pending),
+                recovered=recovered,
+                deferred=len(next_pending),
+                rate_limits=stats.retry_rate_limits,
+                duration_seconds=round(time.monotonic() - round_started, 6),
+            )
             pending = next_pending
 
         for item in pending:
             stats.retry_exhausted += 1
             stats.failures.append(DownloadFailure(item.job.url, str(item.last_error)))
+            self._diagnose(
+                "download_exhausted",
+                url=item.job.url,
+                destination=str(item.job.destination),
+                status_code=self._status_code(item.last_error),
+                error=repr(item.last_error),
+            )
+        self._report_progress("Complete", 1, 1)
+
+    async def _wait_for_retry_round(
+        self, delay: float, round_number: int, pending: int
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + delay
+        while True:
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            self._report_progress(
+                f"Retry {round_number}: waiting {remaining:.0f}s for {pending} files",
+                0,
+                pending,
+            )
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(5.0, remaining))
+
+    def _retry_round_delay(self) -> float:
+        return min(600.0, self.retry_backoff) * random.uniform(0.75, 1.25)
 
     async def _polite_delay(self) -> None:
         if self.delay > 0:
@@ -620,42 +776,91 @@ class SmallSatDownloader:
         *,
         retry_phase: bool,
     ) -> bytes:
-        await self._download_limiter.acquire()
-        try:
+        lock_started = time.monotonic()
+        async with self._download_lock:
+            lock_wait = time.monotonic() - lock_started
+            meter_started = time.monotonic()
+            await self._download_meter.acquire()
+            meter_wait = time.monotonic() - meter_started
             async with self._semaphore:
-                await self._download_polite_delay()
+                request_started = time.monotonic()
+                self._diagnose(
+                    "http_download_request_start",
+                    phase="retry" if retry_phase else "first_pass",
+                    url=url,
+                    serial_wait_seconds=round(lock_wait, 6),
+                    meter_wait_seconds=round(meter_wait, 6),
+                    downloads_per_minute=self.downloads_per_minute,
+                )
                 try:
                     content = await self.client.get_bytes(url)
                 except Exception as exc:
-                    if is_retryable_download_error(exc):
-                        stats.retryable_errors += 1
                     if (
                         isinstance(exc, httpx.HTTPStatusError)
                         and exc.response.status_code in {403, 429}
                     ):
-                        stats.rate_limits += 1
                         if retry_phase:
                             stats.retry_rate_limits += 1
                         else:
                             stats.first_pass_rate_limits += 1
-                        await self._download_limiter.record_rate_limit()
+                        if self._download_circuit_error is None:
+                            self._download_circuit_error = exc
+                            self._diagnose(
+                                "rate_limit_circuit_open",
+                                phase="retry" if retry_phase else "first_pass",
+                                url=url,
+                                status_code=exc.response.status_code,
+                            )
+                    response = (
+                        exc.response
+                        if isinstance(exc, httpx.HTTPStatusError)
+                        else None
+                    )
+                    self._diagnose(
+                        "http_download_request_error",
+                        phase="retry" if retry_phase else "first_pass",
+                        url=url,
+                        status_code=self._status_code(exc),
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        duration_seconds=round(
+                            time.monotonic() - request_started, 6
+                        ),
+                        retry_after=(
+                            response.headers.get("retry-after")
+                            if response is not None
+                            else None
+                        ),
+                        content_type=(
+                            response.headers.get("content-type")
+                            if response is not None
+                            else None
+                        ),
+                        server=(
+                            response.headers.get("server")
+                            if response is not None
+                            else None
+                        ),
+                    )
                     raise
-            await self._download_limiter.record_success()
+                self._diagnose(
+                    "http_download_request_complete",
+                    phase="retry" if retry_phase else "first_pass",
+                    url=url,
+                    bytes=len(content),
+                    duration_seconds=round(time.monotonic() - request_started, 6),
+                )
             return content
-        finally:
-            await self._download_limiter.release()
 
-    async def _download_polite_delay(self) -> None:
-        if self.download_delay > 0:
-            await asyncio.sleep(
-                random.uniform(self.download_delay, self.download_delay * 2)
-            )
+    def _diagnose(self, event: str, **fields: Any) -> None:
+        if self.diagnostic is not None:
+            self.diagnostic(event, fields)
 
-    def _report_download_concurrency(self, limit: int, direction: str) -> None:
-        if direction == "decrease":
-            self.log(f"  Server throttled; reducing PDF concurrency to {limit}")
-        else:
-            self.log(f"  Server stable; increasing PDF concurrency to {limit}")
+    @staticmethod
+    def _status_code(exc: BaseException) -> int | None:
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code
+        return None
 
     async def _probe_available_years(self) -> list[int]:
         current_year = dt.datetime.now().year
@@ -707,4 +912,4 @@ class SmallSatDownloader:
 
     async def _event_has_pdf(self, event: Link) -> bool:
         event_html = await self._get_text(event.url)
-        return parse_event_detail(event_html, event.url, event.title, event.url).pdf_url is not None
+        return parse_event_detail(event_html, event.url, event.title).pdf_url is not None

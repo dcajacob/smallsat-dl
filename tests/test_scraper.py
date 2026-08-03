@@ -5,10 +5,10 @@ from pathlib import Path
 import httpx
 
 from smallsat_dl.scraper import (
-    AdaptiveConcurrencyLimiter,
     DeferredDownload,
     DownloadJob,
     DownloadStats,
+    EventDetail,
     HttpClient,
     Link,
     SmallSatDownloader,
@@ -17,8 +17,8 @@ from smallsat_dl.scraper import (
     parse_event_links,
     parse_session_links,
     prefer_categorized_sessions,
+    resolve_event_session,
 )
-
 
 ARCHIVE_HTML = """
 <html><body>
@@ -167,6 +167,45 @@ def test_prefer_categorized_sessions_drops_aggregate_listing():
     assert prefer_categorized_sessions(sessions) == [sessions[1]]
 
 
+def test_event_is_assigned_to_session_named_in_its_canonical_url():
+    enterprise = Link(
+        "Session VII: Science/Mission Payloads - Enterprise",
+        "https://digitalcommons.usu.edu/smallsat/2025/E-S7-2025",
+    )
+    research = Link(
+        "Session II: Next on the Pad - Research & Academia",
+        "https://digitalcommons.usu.edu/smallsat/2025/RA-S2-2025",
+    )
+    event = Link(
+        "STP-H12-VANTAGE",
+        "https://digitalcommons.usu.edu/smallsat/2025/RA-S2-2025/1",
+    )
+
+    owner = resolve_event_session(
+        enterprise,
+        event,
+        {
+            enterprise.url: enterprise,
+            research.url: research,
+        },
+    )
+
+    assert owner == research
+
+
+def test_crosslisted_event_without_session_url_keeps_source_session():
+    enterprise = Link(
+        "Session II: Next on the Pad - Enterprise",
+        "https://digitalcommons.usu.edu/smallsat/2025/E-S2-2025",
+    )
+    event = Link(
+        "ACMES",
+        "https://digitalcommons.usu.edu/smallsat/2025/all2025/159",
+    )
+
+    assert resolve_event_session(enterprise, event, {enterprise.url: enterprise}) == enterprise
+
+
 def test_parse_event_links_extracts_summary_links():
     events = parse_event_links(SESSION_HTML, "https://digitalcommons.usu.edu/smallsat/2025/all2025/")
     assert [event.title for event in events] == ["Paper One", "Paper Two"]
@@ -178,7 +217,6 @@ def test_parse_event_detail_handles_missing_presentation():
         EVENT_TWO_HTML,
         "https://digitalcommons.usu.edu/smallsat/2025/all2025/2/",
         "Paper Two",
-        "https://digitalcommons.usu.edu/smallsat/2025/all2025/2/",
     )
     assert detail.pdf_url == "https://digitalcommons.usu.edu/smallsat/2025/all2025/2/paper.pdf"
     assert detail.presentation_url is None
@@ -187,6 +225,7 @@ def test_parse_event_detail_handles_missing_presentation():
 def test_downloader_skips_existing_files_and_downloads_missing_targets(tmp_path: Path):
     base = "https://digitalcommons.usu.edu/smallsat/"
     progress_updates: list[tuple[str, int, int]] = []
+    diagnostic_events: list[tuple[str, dict[str, object]]] = []
     paper_one = tmp_path / "2025" / "All 2025 Content" / "Paper One.pdf"
     paper_one.parent.mkdir(parents=True)
     paper_one.write_bytes(b"already here")
@@ -207,15 +246,17 @@ def test_downloader_skips_existing_files_and_downloads_missing_targets(tmp_path:
     downloader = SmallSatDownloader(
         client=client,
         delay=0,
-        download_delay=0,
+        downloads_per_minute=1_000_000,
         log=lambda _: None,
         progress=lambda title, completed, total: progress_updates.append(
             (title, completed, total)
         ),
+        diagnostic=lambda event, fields: diagnostic_events.append((event, fields)),
     )
 
     stats = asyncio.run(downloader.download_year(2025, tmp_path))
 
+    assert stats.file_targets == 3
     assert stats.downloaded == 2
     assert stats.skipped == 1
     assert not stats.failures
@@ -223,8 +264,15 @@ def test_downloader_skips_existing_files_and_downloads_missing_targets(tmp_path:
     assert (tmp_path / "2025" / "All 2025 Content" / "Paper Two.pdf").read_bytes() == b"paper two"
     assert not (tmp_path / "2025" / "All 2025 Content" / "presentations" / "Paper Two.pdf").exists()
     assert progress_updates[0] == ("Inspecting paper pages...", 0, 2)
-    assert [update[1] for update in progress_updates[1:]] == [1, 2]
-    assert {update[0] for update in progress_updates[1:]} == {"Paper One", "Paper Two"}
+    assert [update[1] for update in progress_updates[1:-1]] == [1, 2]
+    assert {update[0] for update in progress_updates[1:-1]} == {"Paper One", "Paper Two"}
+    assert progress_updates[-1] == ("Complete", 1, 1)
+    event_names = [event for event, _ in diagnostic_events]
+    assert "year_start" in event_names
+    assert "sessions_loaded" in event_names
+    assert "event_details_loaded" in event_names
+    assert "download_complete" in event_names
+    assert event_names[-1] == "year_complete"
 
 
 def test_downloader_overlaps_requests_within_concurrency_limit(tmp_path: Path):
@@ -250,15 +298,14 @@ def test_downloader_overlaps_requests_within_concurrency_limit(tmp_path: Path):
     assert client.max_active_requests == 2
 
 
-def test_pdf_downloads_use_separate_lower_concurrency_limit():
+def test_pdf_downloads_are_serial():
     urls = [f"https://example.test/{index}.pdf" for index in range(4)]
     client = TrackingClient(text={}, content={url: b"%PDF" for url in urls})
     downloader = SmallSatDownloader(
         client=client,
         concurrency=8,
-        download_concurrency=2,
         delay=0,
-        download_delay=0,
+        downloads_per_minute=1_000_000,
         log=lambda _: None,
     )
 
@@ -276,7 +323,7 @@ def test_pdf_downloads_use_separate_lower_concurrency_limit():
 
     asyncio.run(fetch_all())
 
-    assert client.max_active_requests == 2
+    assert client.max_active_requests == 1
 
 
 def test_first_pass_defers_rate_limit_and_keeps_moving(monkeypatch, tmp_path: Path):
@@ -302,20 +349,19 @@ def test_first_pass_defers_rate_limit_and_keeps_moving(monkeypatch, tmp_path: Pa
     downloader = SmallSatDownloader(
         client=client,
         concurrency=2,
-        download_concurrency=1,
         retry_rounds=1,
         delay=0,
-        download_delay=0,
+        downloads_per_minute=1_000_000,
         retry_backoff=0,
         log=lambda _: None,
     )
 
     stats = asyncio.run(downloader.download_year(2025, tmp_path))
 
-    assert client.download_calls == [paper_one_url, paper_two_url, paper_one_url]
-    assert stats.first_pass_downloaded == 1
-    assert stats.first_pass_deferred == 1
-    assert stats.retry_recovered == 1
+    assert client.download_calls == [paper_one_url, paper_one_url, paper_two_url]
+    assert stats.first_pass_downloaded == 0
+    assert stats.first_pass_deferred == 2
+    assert stats.retry_recovered == 2
     assert stats.downloaded == 2
     assert stats.retry_rounds == 1
     assert not stats.failures
@@ -342,6 +388,7 @@ def test_deferred_pdf_retries_in_later_rounds(monkeypatch, tmp_path: Path):
         ]
     )
     delays: list[float] = []
+    progress_updates: list[tuple[str, int, int]] = []
 
     async def fake_sleep(delay: float) -> None:
         delays.append(delay)
@@ -351,12 +398,14 @@ def test_deferred_pdf_retries_in_later_rounds(monkeypatch, tmp_path: Path):
     downloader = SmallSatDownloader(
         client=client,
         concurrency=1,
-        download_concurrency=1,
         retry_rounds=2,
         delay=0,
-        download_delay=0,
+        downloads_per_minute=1_000_000,
         retry_backoff=0,
         log=lambda _: None,
+        progress=lambda title, completed, total: progress_updates.append(
+            (title, completed, total)
+        ),
     )
 
     stats = DownloadStats()
@@ -369,34 +418,13 @@ def test_deferred_pdf_retries_in_later_rounds(monkeypatch, tmp_path: Path):
     asyncio.run(downloader._retry_deferred_downloads(deferred, stats))
 
     assert async_client.calls == 2
-    assert len(delays) == 2
-    assert stats.retryable_errors == 1
-    assert stats.rate_limits == 1
+    assert not delays
     assert stats.retry_attempts == 2
     assert stats.retry_recovered == 1
     assert stats.retry_rounds == 2
     assert not stats.failures
     assert (tmp_path / "paper.pdf").read_bytes() == b"%PDF"
-
-
-def test_adaptive_download_concurrency_uses_aimd():
-    changes: list[tuple[int, str]] = []
-    limiter = AdaptiveConcurrencyLimiter(
-        8,
-        increase_after=2,
-        decrease_cooldown=0,
-        on_change=lambda limit, direction: changes.append((limit, direction)),
-    )
-
-    async def exercise_limiter():
-        await limiter.record_rate_limit()
-        await limiter.record_success()
-        await limiter.record_success()
-
-    asyncio.run(exercise_limiter())
-
-    assert limiter.limit == 5
-    assert changes == [(4, "decrease"), (5, "increase")]
+    assert progress_updates[-1] == ("Complete", 1, 1)
 
 
 def test_polite_delay_adds_up_to_full_random_jitter(monkeypatch):
@@ -414,23 +442,30 @@ def test_polite_delay_adds_up_to_full_random_jitter(monkeypatch):
     assert bounds == [(0.25, 0.5)]
 
 
-def test_download_delay_is_slower_and_jittered(monkeypatch):
-    bounds: list[tuple[float, float]] = []
-
-    def fake_uniform(lower: float, upper: float) -> float:
-        bounds.append((lower, upper))
-        return 0
-
-    monkeypatch.setattr("smallsat_dl.scraper.random.uniform", fake_uniform)
+def test_download_meter_has_no_burst_and_fixed_rate():
     downloader = SmallSatDownloader(
         client=FakeClient({}),
-        download_delay=1.0,
+        downloads_per_minute=15,
         log=lambda _: None,
     )
 
-    asyncio.run(downloader._download_polite_delay())
+    assert downloader._download_meter.max_rate == 1
+    assert downloader._download_meter.time_period == 4
 
-    assert bounds == [(1.0, 2.0)]
+
+def test_retry_rounds_use_fixed_jittered_cooldown(monkeypatch):
+    monkeypatch.setattr(
+        "smallsat_dl.scraper.random.uniform",
+        lambda lower, upper: (lower + upper) / 2,
+    )
+    downloader = SmallSatDownloader(
+        client=FakeClient({}),
+        retry_backoff=60,
+        log=lambda _: None,
+    )
+
+    assert downloader._retry_round_delay() == 60
+    assert downloader._retry_round_delay() == 60
 
 
 def test_missing_pdf_is_counted_as_unavailable_not_failure(tmp_path: Path):
@@ -448,6 +483,63 @@ def test_missing_pdf_is_counted_as_unavailable_not_failure(tmp_path: Path):
     stats = asyncio.run(downloader.download_year(2025, tmp_path, dry_run=True))
 
     assert stats.unavailable == 1
+    assert stats.file_targets == 1
+    assert stats.dry_run == 1
+    assert not stats.failures
+
+
+def test_presentation_is_downloaded_when_paper_pdf_is_unavailable(tmp_path: Path):
+    detail = EventDetail(
+        title="Presentation Only",
+        pdf_url=None,
+        presentation_url="https://example.test/presentation.pdf",
+    )
+    downloader = SmallSatDownloader(client=FakeClient({}), delay=0, log=lambda _: None)
+
+    stats, deferred = asyncio.run(
+        downloader._download_event_files(
+            2025,
+            Link("Flash Talk Session 5", "https://example.test/session"),
+            detail,
+            tmp_path,
+            dry_run=True,
+        )
+    )
+
+    assert stats.unavailable == 1
+    assert stats.file_targets == 1
+    assert stats.dry_run == 1
+    assert not stats.failures
+    assert not deferred
+
+
+def test_duplicate_titles_in_same_session_are_scheduled_once(tmp_path: Path):
+    base = "https://digitalcommons.usu.edu/smallsat/"
+    session_url = f"{base}2025/RA-S7-2025/"
+    first_event_url = f"{base}2025/RA-S7-2025/1"
+    second_event_url = f"{base}2025/all2025/11"
+    duplicate_session_html = f"""
+    <table>
+      <tr><td class="event"><p class="summary"><a href="{first_event_url}">Same Paper</a></p></td></tr>
+      <tr><td class="event"><p class="summary"><a href="{second_event_url}">Same Paper</a></p></td></tr>
+    </table>
+    """
+    client = FakeClient(
+        text={
+            f"{base}2025/": f"""
+                <dl id="events-listing">
+                  <a title="Research Session" href="{session_url}">Research Session</a>
+                </dl>
+            """,
+            session_url: duplicate_session_html,
+            first_event_url: EVENT_TWO_HTML,
+        }
+    )
+    downloader = SmallSatDownloader(client=client, delay=0, log=lambda _: None)
+
+    stats = asyncio.run(downloader.download_year(2025, tmp_path, dry_run=True))
+
+    assert stats.file_targets == 1
     assert stats.dry_run == 1
     assert not stats.failures
 

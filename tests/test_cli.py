@@ -1,12 +1,14 @@
-from argparse import Namespace
 import asyncio
+from argparse import Namespace
 from io import StringIO
+from pathlib import Path
 
 import pytest
 from rich.console import Console
 
 import smallsat_dl.cli as cli
 from smallsat_dl.cli import (
+    build_parser,
     defaults_to_latest,
     normalize_requested_years,
     parse_year_list,
@@ -28,8 +30,10 @@ def args(**overrides):
     return Namespace(**values)
 
 
-def test_latest_selects_newest_available_year():
-    assert selected_years_from_args(args(latest=True), [2023, 2024, 2025]) == [2025]
+def test_default_output_uses_downloads_directory():
+    parsed = build_parser().parse_args([])
+
+    assert parsed.output == Path.cwd() / "downloads"
 
 
 def test_repeated_years_are_normalized_newest_first():
@@ -61,6 +65,11 @@ def test_multiple_selectors_are_rejected():
 
     with pytest.raises(ValueError, match="choose only one"):
         selected_years_from_args(args(interactive=True, latest=True), [2025])
+
+
+def test_cli_rejects_multiple_selectors_before_network_access():
+    with pytest.raises(SystemExit):
+        asyncio.run(cli._async_main(["--latest", "--year", "2025"]))
 
 
 def test_unavailable_years_are_rejected():

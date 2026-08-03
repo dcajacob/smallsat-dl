@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-import time
 from typing import TypeVar
 
 from rich.console import Console
 from rich.markup import escape
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+)
 from rich.table import Column
 
+from .diagnostics import JsonlDiagnostics
 from .scraper import DEFAULT_BASE_URL, SmallSatDownloader
 
 console = Console()
@@ -51,13 +58,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path.cwd(),
-        help="download root directory; defaults to the current directory",
+        default=Path.cwd() / "downloads",
+        help="download root directory; defaults to ./downloads",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="show what would be downloaded without writing PDFs",
+    )
+    parser.add_argument(
+        "--diagnostics",
+        type=Path,
+        help="write structured JSON Lines runtime diagnostics",
     )
     parser.add_argument(
         "--delay",
@@ -66,10 +78,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="base request delay with up to 100%% random jitter; defaults to 0.25",
     )
     parser.add_argument(
-        "--download-delay",
+        "--downloads-per-minute",
         type=float,
-        default=1.0,
-        help="base PDF delay with up to 100%% random jitter; defaults to 1.0",
+        default=15.0,
+        help="strict PDF request rate with no initial burst; defaults to 15",
     )
     parser.add_argument(
         "--concurrency",
@@ -78,22 +90,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum concurrent network requests; defaults to 8",
     )
     parser.add_argument(
-        "--download-concurrency",
-        type=int,
-        default=1,
-        help="adaptive maximum concurrent PDF downloads; defaults to 1",
-    )
-    parser.add_argument(
         "--retry-rounds",
         type=int,
-        default=5,
-        help="deferred download retry rounds; defaults to 5",
+        default=20,
+        help="deferred download retry rounds; defaults to 20",
     )
     parser.add_argument(
         "--retry-backoff",
         type=float,
         default=60.0,
-        help="base seconds between deferred retry rounds; defaults to 60",
+        help="base cooldown seconds between retry rounds; defaults to 60",
     )
     parser.add_argument(
         "--base-url",
@@ -106,8 +112,6 @@ def build_parser() -> argparse.ArgumentParser:
 def selected_years_from_args(args: argparse.Namespace, available_years: list[int]) -> list[int] | None:
     validate_year_selector_shape(args)
 
-    if args.latest:
-        return [max(available_years)]
     if args.all:
         return sorted(available_years, reverse=True)
     if args.years:
@@ -211,14 +215,16 @@ async def _async_main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    try:
+        validate_year_selector_shape(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.delay < 0:
         parser.error("--delay must be zero or greater")
-    if args.download_delay < 0:
-        parser.error("--download-delay must be zero or greater")
+    if args.downloads_per_minute <= 0:
+        parser.error("--downloads-per-minute must be greater than zero")
     if args.concurrency < 1:
         parser.error("--concurrency must be at least 1")
-    if args.download_concurrency < 1:
-        parser.error("--download-concurrency must be at least 1")
     if args.retry_rounds < 0:
         parser.error("--retry-rounds must be zero or greater")
     if args.retry_backoff < 0:
@@ -239,6 +245,12 @@ async def _async_main(argv: list[str] | None = None) -> int:
         console=console,
     )
     paper_task = paper_progress.add_task("Preparing downloads...", total=None)
+    diagnostics = JsonlDiagnostics(args.diagnostics) if args.diagnostics else None
+    if diagnostics is not None:
+        diagnostics.record(
+            "run_start",
+            arguments=vars(args),
+        )
 
     def update_paper_progress(title: str, completed: int, total: int) -> None:
         paper_progress.update(
@@ -251,19 +263,28 @@ async def _async_main(argv: list[str] | None = None) -> int:
     downloader = SmallSatDownloader(
         base_url=args.base_url,
         delay=args.delay,
-        download_delay=args.download_delay,
+        downloads_per_minute=args.downloads_per_minute,
         concurrency=args.concurrency,
-        download_concurrency=args.download_concurrency,
         retry_rounds=args.retry_rounds,
         retry_backoff=args.retry_backoff,
         log=lambda message: console.print(message, markup=False),
         progress=update_paper_progress,
+        diagnostic=(
+            (lambda event, fields: diagnostics.record(event, **fields))
+            if diagnostics is not None
+            else None
+        ),
     )
 
     try:
         return await _run_downloader(args, parser, downloader, paper_progress)
     finally:
-        await downloader.close()
+        try:
+            await downloader.close()
+        finally:
+            if diagnostics is not None:
+                diagnostics.record("run_end")
+                diagnostics.close()
 
 
 async def _run_downloader(
@@ -305,15 +326,8 @@ async def _run_downloader(
         f"[bold]Downloading years:[/bold] {', '.join(str(year) for year in years)}"
     )
     console.print(f"[bold]Output directory:[/bold] {args.output}")
-    console.print(
-        f"[bold]Concurrent requests:[/bold] {args.concurrency}"
-    )
-    console.print(
-        f"[bold]Adaptive PDF concurrency maximum:[/bold] {args.download_concurrency}"
-    )
-    console.print(f"[bold]PDF request delay:[/bold] {args.download_delay:.2f}s + jitter")
-    console.print(f"[bold]Deferred retry rounds:[/bold] {args.retry_rounds}")
-    console.print(f"[bold]Retry round base backoff:[/bold] {args.retry_backoff:.1f}s")
+    if args.diagnostics:
+        console.print(f"[bold]Diagnostics:[/bold] {args.diagnostics}")
 
     console.print("[bold cyan]Processing papers...[/bold cyan]")
     download_started = time.monotonic()
@@ -322,6 +336,7 @@ async def _run_downloader(
     elapsed = time.monotonic() - download_started
     console.print(
         "[bold green]Done:[/bold green] "
+        f"{stats.file_targets} total file(s), "
         f"{stats.downloaded} downloaded, "
         f"{stats.skipped} skipped, "
         f"{stats.dry_run} dry-run target(s), "
