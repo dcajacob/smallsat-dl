@@ -1,0 +1,3 @@
+recursive-include scripts *.py
+recursive-include docs *.md
+prune docs/experiments

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -20,6 +21,8 @@ from rich.progress import (
 )
 from rich.table import Column
 
+from .cache import DEFAULT_CACHE_TTL, MetadataCache
+from .conversion import PresentationConversionQueue
 from .diagnostics import JsonlDiagnostics
 from .scraper import DEFAULT_BASE_URL, SmallSatDownloader
 
@@ -67,6 +70,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="show what would be downloaded without writing PDFs",
     )
     parser.add_argument(
+        "--discovery",
+        choices=("auto", "oai", "html"),
+        default="auto",
+        help="metadata discovery method; defaults to auto (OAI with HTML fallback)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="disable metadata cache reads and writes",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        help="metadata cache directory; defaults to OUTPUT/.smallsat-cache",
+    )
+    parser.add_argument(
+        "--cache-ttl",
+        type=float,
+        default=DEFAULT_CACHE_TTL,
+        help="metadata cache lifetime in seconds; defaults to 86400 (24 hours)",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("httpx", "curl-cffi"),
+        default="curl-cffi",
+        help="HTTP transport; defaults to curl-cffi; httpx is also available",
+    )
+    parser.add_argument(
+        "--no-convert",
+        action="store_true",
+        help="keep original presentation files without generating PDF copies",
+    )
+    parser.add_argument(
+        "--conversion-workers",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="maximum concurrent background PDF conversions; defaults to 1",
+    )
+    parser.add_argument(
         "--diagnostics",
         type=Path,
         help="write structured JSON Lines runtime diagnostics",
@@ -80,8 +123,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--downloads-per-minute",
         type=float,
-        default=15.0,
-        help="strict PDF request rate with no initial burst; defaults to 15",
+        default=30.0,
+        help="strict file request rate with no initial burst; defaults to 30",
     )
     parser.add_argument(
         "--concurrency",
@@ -219,16 +262,18 @@ async def _async_main(argv: list[str] | None = None) -> int:
         validate_year_selector_shape(args)
     except ValueError as exc:
         parser.error(str(exc))
-    if args.delay < 0:
-        parser.error("--delay must be zero or greater")
-    if args.downloads_per_minute <= 0:
-        parser.error("--downloads-per-minute must be greater than zero")
+    if not math.isfinite(args.delay) or args.delay < 0:
+        parser.error("--delay must be a finite number zero or greater")
+    if not math.isfinite(args.downloads_per_minute) or args.downloads_per_minute <= 0:
+        parser.error("--downloads-per-minute must be a finite number greater than zero")
     if args.concurrency < 1:
         parser.error("--concurrency must be at least 1")
     if args.retry_rounds < 0:
         parser.error("--retry-rounds must be zero or greater")
-    if args.retry_backoff < 0:
-        parser.error("--retry-backoff must be zero or greater")
+    if not math.isfinite(args.retry_backoff) or args.retry_backoff < 0:
+        parser.error("--retry-backoff must be a finite number zero or greater")
+    if not math.isfinite(args.cache_ttl) or args.cache_ttl < 0:
+        parser.error("--cache-ttl must be a finite number zero or greater")
 
     paper_progress = Progress(
         SpinnerColumn(),
@@ -260,31 +305,83 @@ async def _async_main(argv: list[str] | None = None) -> int:
             total=total,
         )
 
-    downloader = SmallSatDownloader(
-        base_url=args.base_url,
-        delay=args.delay,
-        downloads_per_minute=args.downloads_per_minute,
-        concurrency=args.concurrency,
-        retry_rounds=args.retry_rounds,
-        retry_backoff=args.retry_backoff,
-        log=lambda message: console.print(message, markup=False),
-        progress=update_paper_progress,
-        diagnostic=(
-            (lambda event, fields: diagnostics.record(event, **fields))
-            if diagnostics is not None
-            else None
-        ),
+    diagnostic = (
+        (lambda event, fields: diagnostics.record(event, **fields))
+        if diagnostics is not None
+        else None
     )
-
+    cache = None
+    conversions = None
+    downloader = None
     try:
-        return await _run_downloader(args, parser, downloader, paper_progress)
+        if not args.no_cache:
+            cache_dir = args.cache_dir if args.cache_dir is not None else args.output / ".smallsat-cache"
+            cache = MetadataCache(
+                cache_dir / "metadata.sqlite3",
+                ttl=args.cache_ttl,
+                log=lambda message: console.print(message, markup=False),
+            )
+        if not args.no_convert and not args.dry_run:
+            conversions = PresentationConversionQueue(
+                workers=args.conversion_workers,
+                log=lambda message: console.print(message, markup=False),
+                diagnostic=diagnostic,
+            )
+        try:
+            downloader = SmallSatDownloader(
+                base_url=args.base_url,
+                delay=args.delay,
+                downloads_per_minute=args.downloads_per_minute,
+                concurrency=args.concurrency,
+                retry_rounds=args.retry_rounds,
+                retry_backoff=args.retry_backoff,
+                log=lambda message: console.print(message, markup=False),
+                progress=update_paper_progress,
+                diagnostic=diagnostic,
+                file_ready=conversions.submit if conversions is not None else None,
+                discovery=args.discovery,
+                cache=cache,
+                transport=args.transport,
+            )
+        except RuntimeError as exc:
+            error_console.print(f"Error: {exc}", markup=False)
+            return 1
+        result = await _run_downloader(args, parser, downloader, paper_progress)
+        if conversions is not None:
+            console.print("[bold cyan]Finishing presentation PDF conversions...[/bold cyan]")
+            conversion_stats = await conversions.finish()
+            console.print(
+                "[bold]PDF conversions:[/bold] "
+                f"{conversion_stats.converted} converted, "
+                f"{conversion_stats.skipped} already available, "
+                f"{len(conversion_stats.failures)} failure(s)."
+            )
+            for failure in conversion_stats.failures[:MAX_DISPLAYED_FAILURES]:
+                error_console.print(f"  {failure.source}: {failure.message}", markup=False)
+            if len(conversion_stats.failures) > MAX_DISPLAYED_FAILURES:
+                error_console.print(
+                    f"  ... and {len(conversion_stats.failures) - MAX_DISPLAYED_FAILURES} "
+                    "more conversion failure(s)."
+                )
+            if conversion_stats.failures:
+                result = 1
+        return result
     finally:
         try:
-            await downloader.close()
+            if conversions is not None:
+                await conversions.close()
         finally:
-            if diagnostics is not None:
-                diagnostics.record("run_end")
-                diagnostics.close()
+            try:
+                if downloader is not None:
+                    await downloader.close()
+            finally:
+                try:
+                    if cache is not None:
+                        cache.close()
+                finally:
+                    if diagnostics is not None:
+                        diagnostics.record("run_end")
+                        diagnostics.close()
 
 
 async def _run_downloader(

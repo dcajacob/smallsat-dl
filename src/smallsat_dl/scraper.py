@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import math
 import random
 import re
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 from aiolimiter import AsyncLimiter
 from bs4 import BeautifulSoup
 
+from .cache import MetadataCache
+from . import oai
+from .legacy import presentation_suffix, reuse_legacy_download
 from .paths import paper_path, presentation_path, session_dir
+from .transports import CurlCffiClient, write_stream_atomic
 
 DEFAULT_BASE_URL = "https://digitalcommons.usu.edu/smallsat/"
 YEAR_RE = re.compile(r"/smallsat/(\d{4})/")
@@ -36,6 +42,23 @@ def is_retryable_download_error(exc: BaseException) -> bool:
     )
 
 
+def _write_bytes_atomic(destination: Path, content: bytes) -> None:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent,
+            prefix=".smallsat-",
+            suffix=".part",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+        temporary_path.replace(destination)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 @dataclass(frozen=True)
 class Link:
     title: str
@@ -47,6 +70,8 @@ class EventDetail:
     title: str
     pdf_url: str | None
     presentation_url: str | None
+    presentation_filename: str | None = None
+    additional_files: tuple[Link, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,11 +130,15 @@ class DownloadStats:
 
 class HttpClient:
     def __init__(
-        self, timeout: float = 30.0, *, client: httpx.AsyncClient | None = None
+        self, timeout: float = 30.0, *, client: httpx.AsyncClient | None = None,
+        transport: str = "curl-cffi",
     ) -> None:
-        self.client = client or httpx.AsyncClient(
-            timeout=timeout,
-            follow_redirects=True,
+        if transport not in {"httpx", "curl-cffi"}:
+            raise ValueError("transport must be httpx or curl-cffi")
+        self.client = client or (
+            CurlCffiClient(timeout=timeout)
+            if transport == "curl-cffi"
+            else httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         )
 
     async def get_text(self, url: str) -> str:
@@ -123,6 +152,22 @@ class HttpClient:
         if "text/html" in response.headers.get("content-type", "").lower():
             raise RuntimeError(f"expected a downloadable file but received HTML from {url}")
         return response.content
+
+    async def download_to(
+        self, url: str, destination: Path, *, progress: Callable[[int], None] | None = None,
+    ) -> int:
+        if isinstance(self.client, CurlCffiClient):
+            return await self.client.download_to(url, destination, progress=progress)
+        if isinstance(self.client, httpx.AsyncClient):
+            async with self.client.stream("GET", url) as response:
+                response.raise_for_status()
+                if "html" in response.headers.get("content-type", "").lower():
+                    raise RuntimeError(f"expected a downloadable file but received HTML from {url}")
+                return await write_stream_atomic(destination, response.aiter_bytes(), progress=progress)
+        # Preserve injected get-only clients used by integrations.
+        content = await self.get_bytes(url)
+        await asyncio.to_thread(_write_bytes_atomic, destination, content)
+        return len(content)
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -161,11 +206,15 @@ def parse_available_years(html: str) -> list[int]:
     return sorted(year for year in years if 1987 <= year <= 2100)
 
 
+class InvalidArchivePage(RuntimeError):
+    """A successful HTTP response did not contain the expected archive page."""
+
+
 def parse_session_links(html: str, base_url: str) -> list[Link]:
     soup = BeautifulSoup(html, "html.parser")
     listing = soup.find("dl", id="events-listing")
     if listing is None:
-        return []
+        raise InvalidArchivePage(f"Unrecognized SmallSat year page: {base_url}")
 
     links: list[Link] = []
     for anchor in listing.find_all("a", href=True):
@@ -175,22 +224,24 @@ def parse_session_links(html: str, base_url: str) -> list[Link]:
     return links
 
 
+def is_aggregate_session(session: Link) -> bool:
+    title = session.title.casefold()
+    return title.startswith("all ") and title.endswith(" content")
+
+
 def prefer_categorized_sessions(sessions: list[Link]) -> list[Link]:
-    categorized = [
-        session
-        for session in sessions
-        if not (
-            session.title.casefold().startswith("all ")
-            and session.title.casefold().endswith(" content")
-        )
-    ]
-    return categorized or sessions
+    # Aggregate listings can contain papers missing from every category. Inspect
+    # them last so shared events retain their categorized output directory.
+    return sorted(sessions, key=is_aggregate_session)
 
 
 def parse_event_links(html: str, base_url: str) -> list[Link]:
     soup = BeautifulSoup(html, "html.parser")
+    event_cells = soup.find_all("td", class_="event")
+    if not event_cells and soup.find("table", class_="vcalendar") is None:
+        raise InvalidArchivePage(f"Unrecognized SmallSat session page: {base_url}")
     events: list[Link] = []
-    for event in soup.find_all("td", class_="event"):
+    for event in event_cells:
         summary = event.find("p", class_="summary")
         if summary is None:
             continue
@@ -209,23 +260,54 @@ def resolve_event_session(
     sessions_by_url: dict[str, Link],
 ) -> Link:
     event_parent_url = event.url.rstrip("/").rsplit("/", 1)[0]
-    return sessions_by_url.get(event_parent_url, source_session)
+    canonical_session = sessions_by_url.get(event_parent_url)
+    if canonical_session is None or is_aggregate_session(canonical_session):
+        return source_session
+    return canonical_session
+
+
+def validate_event_page(html: str, base_url: str) -> None:
+    soup = BeautifulSoup(html, "html.parser")
+    if (
+        soup.find("a", id="pdf", href=True) is not None
+        or soup.select_one("div.files a[href]") is not None
+        or soup.find("meta", attrs={"name": "bepress_citation_title"}) is not None
+        or (
+            soup.find("div", id="title") is not None
+            and soup.find("div", id="document_type") is not None
+        )
+    ):
+        return
+    raise InvalidArchivePage(f"Unrecognized SmallSat event page: {base_url}")
 
 
 def parse_event_detail(html: str, base_url: str, fallback_title: str) -> EventDetail:
     soup = BeautifulSoup(html, "html.parser")
     pdf_anchor = soup.find("a", id="pdf", href=True)
     files = soup.find("div", class_="files")
-    presentation_anchor = files.find("a", href=True) if files is not None else None
+    anchors = files.find_all("a", href=True) if files is not None else []
+    attachments = list({
+        urljoin(base_url, anchor["href"]): Link(
+            anchor.get("download") or anchor.get_text(" ", strip=True),
+            urljoin(base_url, anchor["href"]),
+        ) for anchor in anchors
+    }.values())
+    first = attachments[0] if attachments else None
 
     return EventDetail(
         title=fallback_title,
         pdf_url=urljoin(base_url, pdf_anchor["href"]) if pdf_anchor is not None else None,
         presentation_url=(
-            urljoin(base_url, presentation_anchor["href"])
-            if presentation_anchor is not None
+            first.url
+            if first is not None
             else None
         ),
+        presentation_filename=(
+            first.title
+            if first is not None
+            else None
+        ),
+        additional_files=tuple(attachments[1:]),
     )
 
 
@@ -236,24 +318,34 @@ class SmallSatDownloader:
         client: HttpClient | None = None,
         base_url: str = DEFAULT_BASE_URL,
         delay: float = 0.25,
-        downloads_per_minute: float = 15.0,
+        downloads_per_minute: float = 30.0,
         concurrency: int = 8,
         retry_rounds: int = 20,
         retry_backoff: float = 60.0,
         log: Callable[[str], None] = print,
         progress: ProgressCallback | None = None,
         diagnostic: DiagnosticCallback | None = None,
+        file_ready: Callable[[Path], None] | None = None,
+        discovery: str = "auto",
+        cache: MetadataCache | None = None,
+        transport: str = "curl-cffi",
     ) -> None:
         if concurrency < 1:
             raise ValueError("concurrency must be at least 1")
         if retry_rounds < 0:
             raise ValueError("retry rounds must be zero or greater")
-        if downloads_per_minute <= 0:
-            raise ValueError("downloads per minute must be greater than zero")
-        if retry_backoff < 0:
-            raise ValueError("retry backoff must be zero or greater")
+        if not math.isfinite(delay) or delay < 0:
+            raise ValueError("delay must be a finite number zero or greater")
+        if not math.isfinite(downloads_per_minute) or downloads_per_minute <= 0:
+            raise ValueError("downloads per minute must be a finite number greater than zero")
+        if not math.isfinite(retry_backoff) or retry_backoff < 0:
+            raise ValueError("retry backoff must be a finite number zero or greater")
+        if discovery not in {"auto", "oai", "html"}:
+            raise ValueError("discovery must be auto, oai, or html")
+        if transport not in {"httpx", "curl-cffi"}:
+            raise ValueError("transport must be httpx or curl-cffi")
         self._owns_client = client is None
-        self.client = client or HttpClient()
+        self.client = client or HttpClient(transport=transport)
         self.base_url = base_url.rstrip("/") + "/"
         self.delay = delay
         self.downloads_per_minute = downloads_per_minute
@@ -262,18 +354,105 @@ class SmallSatDownloader:
         self.log = log
         self.progress = progress
         self.diagnostic = diagnostic
+        self.file_ready = file_ready
+        self.discovery = discovery
+        self.cache = cache
+        self._oai_tasks: dict[int, asyncio.Task[list[oai.OaiRecord] | None]] = {}
+        self._oai_records: dict[int, list[oai.OaiRecord]] = {}
         self._download_lock = asyncio.Lock()
         self._download_meter = AsyncLimiter(1, 60.0 / downloads_per_minute)
         self._max_retry_rounds = retry_rounds
         self._download_circuit_error: BaseException | None = None
 
     async def close(self) -> None:
+        pending = [task for task in self._oai_tasks.values() if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         if self._owns_client:
             await self.client.close()
 
+    async def _records_for_year(self, year: int) -> list[oai.OaiRecord] | None:
+        if self.discovery == "html":
+            return None
+        if year not in self._oai_tasks:
+            self._oai_tasks[year] = asyncio.create_task(self._discover_oai_year(year))
+        return await self._oai_tasks[year]
+
+    async def _discover_oai_year(self, year: int) -> list[oai.OaiRecord] | None:
+        endpoint = oai.endpoint_for_base_url(self.base_url)
+        set_spec = f"publication:{urlsplit(self.base_url).path.strip('/')}/{year}"
+        cache_key = f"{endpoint}#smallsat-dl:oai-v1:{set_spec}"
+        try:
+            cached = self.cache.get(cache_key) if self.cache is not None else None
+            records = None
+            if cached is not None:
+                try:
+                    records = oai.records_from_json(cached)
+                    self._diagnose("metadata_cache_hit", url=cache_key, records=len(records))
+                except (oai.OaiError, ValueError, TypeError, KeyError):
+                    self.cache.invalidate(cache_key)
+                    records = None
+            if records is None:
+                records = await oai.discover_records(
+                    self._get_text, endpoint=endpoint, set_spec=set_spec,
+                )
+                # Cache complete snapshots, never expiring pagination tokens or
+                # partial harvests that could silently omit papers next time.
+                if self.cache is not None:
+                    self.cache.put(cache_key, oai.records_to_json(records))
+            matching = [record for record in records if record.year == year]
+            if len(matching) != len(records):
+                self._diagnose(
+                    "oai_records_outside_year", year=year, ignored=len(records) - len(matching),
+                )
+            # Set membership can lag behind moved papers. Use the landing URL's
+            # year and retain HTML fallback for stale/missing record identities.
+            records = matching
+            self._oai_records[year] = records
+            self.log(f"  OAI discovery: {len(records)} records for {year}")
+            self._diagnose("oai_discovery_complete", year=year, records=len(records))
+            return records
+        except oai.OaiError as exc:
+            self._diagnose("oai_discovery_failed", year=year, error=str(exc))
+            if self.discovery == "oai":
+                raise
+            self.log(f"  OAI unavailable for {year}; using HTML discovery: {exc}")
+            return None
+
+    def _oai_detail(self, event: Link) -> EventDetail | None:
+        match = YEAR_RE.search(urlsplit(event.url).path)
+        if match is None:
+            return None
+        records = self._oai_records.get(int(match.group(1)), [])
+        candidates = [record for record in records if record.event_url.rstrip("/") == event.url.rstrip("/")]
+        # A title alone cannot prove identity: a distinct paper omitted from the
+        # feed can share the title of a known record. Resolve unmatched URLs via
+        # their own HTML metadata before deduplicating by file identity.
+        if len(candidates) != 1:
+            return None
+        record = candidates[0]
+        presentation_url = record.supplemental_urls[0] if record.supplemental_urls else None
+        if record.primary_url is None and presentation_url is None:
+            return None
+        presentation_filename = (
+            Path(unquote(urlsplit(presentation_url).path)).name
+            if presentation_url is not None
+            else None
+        )
+        return EventDetail(
+            event.title, record.primary_url, presentation_url, presentation_filename,
+            tuple(Link(Path(unquote(urlsplit(url).path)).name, url)
+                  for url in record.supplemental_urls[1:]),
+        )
+
     async def discover_available_years(self) -> list[int]:
         try:
-            html = await self._get_text(self.base_url)
+            def validate_years(html: str) -> None:
+                if not parse_available_years(html):
+                    raise InvalidArchivePage(f"Unrecognized SmallSat archive page: {self.base_url}")
+            html = await self._get_text(self.base_url, validator=validate_years)
             years = parse_available_years(html)
         except Exception:  # noqa: BLE001 - fallback probes year pages directly.
             years = []
@@ -292,9 +471,12 @@ class SmallSatDownloader:
             candidates.insert(0, today.year)
 
         results = await asyncio.gather(
-            *(self._year_has_downloadable_pdf(year) for year in candidates)
+            *(self._year_has_downloadable_pdf(year) for year in candidates),
+            return_exceptions=True,
         )
         for year, has_pdf in zip(candidates, results, strict=True):
+            if isinstance(has_pdf, BaseException):
+                raise has_pdf
             if has_pdf:
                 return year
         raise RuntimeError("Could not find a SmallSat archive year containing a paper PDF")
@@ -322,7 +504,10 @@ class SmallSatDownloader:
         )
 
         try:
-            year_html = await self._get_text(year_url)
+            records = await self._records_for_year(year)
+            year_html = await self._get_text(
+                year_url, validator=lambda html: parse_session_links(html, year_url),
+            )
             sessions = prefer_categorized_sessions(parse_session_links(year_html, year_url))
         except Exception as exc:  # noqa: BLE001 - keep crawling other requested years.
             stats.failures.append(DownloadFailure(year_url, str(exc)))
@@ -346,9 +531,10 @@ class SmallSatDownloader:
             session_path.mkdir(parents=True, exist_ok=True)
             (session_path / "presentations").mkdir(parents=True, exist_ok=True)
             for event in result:
-                if event.url in seen_event_urls:
+                event_url = event.url.rstrip("/")
+                if event_url in seen_event_urls:
                     continue
-                seen_event_urls.add(event.url)
+                seen_event_urls.add(event_url)
                 owner_session = resolve_event_session(
                     source_session,
                     event,
@@ -369,6 +555,24 @@ class SmallSatDownloader:
                     continue
                 seen_event_destinations.add(destination)
                 event_jobs.append((owner_session, event))
+
+        # OAI can expose records absent from every HTML listing. Keep those too,
+        # using the aggregate directory when there is no categorized owner.
+        if records:
+            fallback_session = next(
+                (session for session in sessions if is_aggregate_session(session)),
+                Link(f"All {year} Content", year_url),
+            )
+            for record in records:
+                if record.event_url.rstrip("/") in seen_event_urls:
+                    continue
+                event = Link(record.title, record.event_url)
+                owner = resolve_event_session(fallback_session, event, sessions_by_url)
+                destination = paper_path(output_dir, year, owner.title, event.title)
+                if destination not in seen_event_destinations:
+                    seen_event_urls.add(record.event_url.rstrip("/"))
+                    seen_event_destinations.add(destination)
+                    event_jobs.append((owner, event))
 
         total_events = len(event_jobs)
         self.log(f"  Found {len(sessions)} sessions and {total_events} unique papers")
@@ -392,6 +596,7 @@ class SmallSatDownloader:
         )
         download_events: list[tuple[Link, Link, EventDetail]] = []
         deferred_downloads: list[DeferredDownload] = []
+        seen_event_files: set[tuple[str | None, ...]] = set()
         completed = 0
         for (session, event), result in zip(event_jobs, detail_results, strict=True):
             if isinstance(result, BaseException):
@@ -400,11 +605,18 @@ class SmallSatDownloader:
                 completed += 1
                 self._report_progress(event.title, completed, total_events)
                 continue
-            if result.pdf_url is None and result.presentation_url is None:
+            if result.pdf_url is None and result.presentation_url is None and not result.additional_files:
                 stats.unavailable += 1
                 completed += 1
                 self._report_progress(event.title, completed, total_events)
                 continue
+            event_files = (result.pdf_url, result.presentation_url, *(link.url for link in result.additional_files))
+            if event_files in seen_event_files:
+                self._diagnose("duplicate_event_files", event_url=event.url)
+                completed += 1
+                self._report_progress(event.title, completed, total_events)
+                continue
+            seen_event_files.add(event_files)
             download_events.append((session, event, result))
 
         self._diagnose(
@@ -485,11 +697,19 @@ class SmallSatDownloader:
         return stats
 
     async def _load_session(self, session: Link) -> list[Link]:
-        session_html = await self._get_text(session.url)
+        session_html = await self._get_text(
+            session.url, validator=lambda html: parse_event_links(html, session.url),
+        )
         return parse_event_links(session_html, session.url)
 
     async def _load_event_detail(self, event: Link) -> EventDetail:
-        event_html = await self._get_text(event.url)
+        detail = self._oai_detail(event)
+        if detail is not None:
+            self._diagnose("oai_event_detail", event_url=event.url)
+            return detail
+        event_html = await self._get_text(
+            event.url, validator=lambda html: validate_event_page(html, event.url),
+        )
         return parse_event_detail(event_html, event.url, event.title)
 
     async def _download_event_files(
@@ -508,22 +728,41 @@ class SmallSatDownloader:
             downloads.append(
                 DownloadJob(
                     detail.pdf_url,
-                    paper_path(output_dir, year, session.title, detail.title),
+                    paper_path(output_dir, year, session.title, detail.title, url=detail.pdf_url),
                 )
             )
-        if detail.pdf_url is None and detail.presentation_url is not None:
+        if detail.pdf_url is None and (detail.presentation_url is not None or detail.additional_files):
             stats.unavailable += 1
+        attachments = []
         if detail.presentation_url is not None:
+            attachments.append(Link(detail.presentation_filename or "", detail.presentation_url))
+        attachments.extend(detail.additional_files)
+        seen_attachment_urls: set[str] = set()
+        for attachment in attachments:
+            if attachment.url in seen_attachment_urls:
+                continue
+            seen_attachment_urls.add(attachment.url)
+            number = len(seen_attachment_urls)
+            title = detail.title if number == 1 else f"{detail.title} - Attachment {number}"
             downloads.append(
                 DownloadJob(
-                    detail.presentation_url,
-                    presentation_path(output_dir, year, session.title, detail.title),
+                    attachment.url,
+                    presentation_path(
+                        output_dir,
+                        year,
+                        session.title,
+                        title,
+                        filename=attachment.title,
+                        url=attachment.url,
+                    ),
                 )
             )
         stats.file_targets = len(downloads)
 
         for job in downloads:
-            if self._download_circuit_error is not None:
+            if not dry_run:
+                await self._reuse_legacy_file(job)
+            if self._download_circuit_error is not None and not job.destination.exists():
                 stats.first_pass_deferred += 1
                 deferred.append(
                     DeferredDownload(job, self._download_circuit_error)
@@ -570,6 +809,33 @@ class SmallSatDownloader:
 
         return stats, deferred
 
+    async def _reuse_legacy_file(self, job: DownloadJob) -> None:
+        if job.destination.suffix.lower() == ".pdf" or job.destination.exists():
+            return
+        if await asyncio.to_thread(reuse_legacy_download, job.destination):
+            self._diagnose(
+                "legacy_file_reused", url=job.url, destination=str(job.destination),
+                legacy_path=str(job.destination.with_suffix(".pdf")),
+                bytes=job.destination.stat().st_size,
+            )
+
+    async def _notify_file_ready(self, destination: Path) -> None:
+        if self.file_ready is None:
+            return
+        source = destination
+        if destination.suffix.lower() == ".pdf":
+            suffix = await asyncio.to_thread(presentation_suffix, destination)
+            if suffix is not None:
+                corrected = destination.with_suffix(suffix)
+                reused = await asyncio.to_thread(reuse_legacy_download, corrected)
+                if reused or (corrected.exists() and corrected.samefile(destination)):
+                    source = corrected
+                    self._diagnose(
+                        "download_format_corrected", original_path=str(destination),
+                        destination=str(corrected), suffix=suffix,
+                    )
+        self.file_ready(source)
+
     async def _download_once(
         self,
         job: DownloadJob,
@@ -578,6 +844,8 @@ class SmallSatDownloader:
         dry_run: bool,
         retry_phase: bool,
     ) -> None:
+        if not dry_run:
+            await self._reuse_legacy_file(job)
         if job.destination.exists():
             stats.skipped += 1
             self._diagnose(
@@ -587,6 +855,8 @@ class SmallSatDownloader:
                 destination=str(job.destination),
                 existing_bytes=job.destination.stat().st_size,
             )
+            if not dry_run and self.file_ready is not None:
+                await self._notify_file_ready(job.destination)
             return
 
         if dry_run:
@@ -613,8 +883,13 @@ class SmallSatDownloader:
             job.url,
             stats,
             retry_phase=retry_phase,
+            destination=job.destination,
         )
-        await asyncio.to_thread(job.destination.write_bytes, content)
+        if isinstance(content, bytes):
+            await asyncio.to_thread(_write_bytes_atomic, job.destination, content)
+            byte_count = len(content)
+        else:
+            byte_count = content
         stats.downloaded += 1
         if retry_phase:
             stats.retry_recovered += 1
@@ -625,9 +900,11 @@ class SmallSatDownloader:
             phase="retry" if retry_phase else "first_pass",
             url=job.url,
             destination=str(job.destination),
-            bytes=len(content),
+            bytes=byte_count,
             duration_seconds=round(time.monotonic() - started, 6),
         )
+        if self.file_ready is not None:
+            await self._notify_file_ready(job.destination)
 
     async def _retry_deferred_downloads(
         self,
@@ -664,7 +941,11 @@ class SmallSatDownloader:
             )
 
             for item in pending:
-                if self._download_circuit_error is not None:
+                await self._reuse_legacy_file(item.job)
+                if (
+                    self._download_circuit_error is not None
+                    and not item.job.destination.exists()
+                ):
                     next_pending.append(
                         DeferredDownload(item.job, self._download_circuit_error)
                     )
@@ -764,10 +1045,27 @@ class SmallSatDownloader:
         if self.progress is not None:
             self.progress(title, completed, total)
 
-    async def _get_text(self, url: str) -> str:
+    async def _get_text(
+        self, url: str, *, validator: Callable[[str], object] | None = None,
+    ) -> str:
+        if self.cache is not None and validator is not None:
+            cached = self.cache.get(url)
+            if cached is not None:
+                try:
+                    validator(cached)
+                except Exception:
+                    self.cache.invalidate(url)
+                else:
+                    self._diagnose("metadata_cache_hit", url=url)
+                    return cached
         async with self._semaphore:
             await self._polite_delay()
-            return await self.client.get_text(url)
+            text = await self.client.get_text(url)
+        if validator is not None:
+            validator(text)
+            if self.cache is not None:
+                self.cache.put(url, text)
+        return text
 
     async def _get_bytes_once(
         self,
@@ -775,7 +1073,8 @@ class SmallSatDownloader:
         stats: DownloadStats,
         *,
         retry_phase: bool,
-    ) -> bytes:
+        destination: Path | None = None,
+    ) -> bytes | int:
         lock_started = time.monotonic()
         async with self._download_lock:
             lock_wait = time.monotonic() - lock_started
@@ -793,7 +1092,16 @@ class SmallSatDownloader:
                     downloads_per_minute=self.downloads_per_minute,
                 )
                 try:
-                    content = await self.client.get_bytes(url)
+                    if destination is not None and hasattr(self.client, "download_to"):
+                        content = await self.client.download_to(
+                            url, destination,
+                            progress=lambda count: self._diagnose(
+                                "http_download_progress", url=url, bytes=count,
+                                duration_seconds=round(time.monotonic() - request_started, 6),
+                            ),
+                        )
+                    else:
+                        content = await self.client.get_bytes(url)
                 except Exception as exc:
                     if (
                         isinstance(exc, httpx.HTTPStatusError)
@@ -847,7 +1155,7 @@ class SmallSatDownloader:
                     "http_download_request_complete",
                     phase="retry" if retry_phase else "first_pass",
                     url=url,
-                    bytes=len(content),
+                    bytes=len(content) if isinstance(content, bytes) else content,
                     duration_seconds=round(time.monotonic() - request_started, 6),
                 )
             return content
@@ -871,15 +1179,24 @@ class SmallSatDownloader:
     async def _year_has_sessions(self, year: int) -> bool:
         year_url = urljoin(self.base_url, f"{year}/")
         try:
-            html = await self._get_text(year_url)
+            html = await self._get_text(
+                year_url, validator=lambda html: parse_session_links(html, year_url),
+            )
+            return bool(parse_session_links(html, year_url))
         except Exception:  # noqa: BLE001 - missing/failing years are not available.
             return False
-        return bool(parse_session_links(html, year_url))
 
     async def _year_has_downloadable_pdf(self, year: int) -> bool:
+        records = await self._records_for_year(year)
+        if records and any(record.primary_url for record in records):
+            return True
         year_url = urljoin(self.base_url, f"{year}/")
         try:
-            year_html = await self._get_text(year_url)
+            year_html = await self._get_text(
+                year_url, validator=lambda html: parse_session_links(html, year_url),
+            )
+        except InvalidArchivePage:
+            raise
         except Exception:  # noqa: BLE001 - missing/failing years cannot contain a PDF.
             return False
 
@@ -888,8 +1205,11 @@ class SmallSatDownloader:
             *(self._load_session(session) for session in sessions),
             return_exceptions=True,
         )
+        invalid_pages = [
+            result for result in session_results if isinstance(result, InvalidArchivePage)
+        ]
         events_by_url = {
-            event.url: event
+            event.url.rstrip("/"): event
             for result in session_results
             if not isinstance(result, BaseException)
             for event in result
@@ -905,11 +1225,20 @@ class SmallSatDownloader:
                             pending.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
                     return True
+            except InvalidArchivePage as exc:
+                invalid_pages.append(exc)
             except Exception:  # noqa: BLE001 - continue checking other event pages.
                 continue
 
+        if invalid_pages:
+            raise invalid_pages[0]
         return False
 
     async def _event_has_pdf(self, event: Link) -> bool:
-        event_html = await self._get_text(event.url)
+        detail = self._oai_detail(event)
+        if detail is not None:
+            return detail.pdf_url is not None
+        event_html = await self._get_text(
+            event.url, validator=lambda html: validate_event_page(html, event.url),
+        )
         return parse_event_detail(event_html, event.url, event.title).pdf_url is not None

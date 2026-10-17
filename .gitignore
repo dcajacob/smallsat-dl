@@ -2,6 +2,7 @@
 __pycache__/
 *.py[oc]
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 build/
@@ -18,3 +19,7 @@ wheels/
 /download-*-diagnostics*.log
 /download-*-diagnostics*.jsonl
 /download-*-console.log
+
+# Local corpus analysis and raw acquisition/experiment records
+/analysis/
+/docs/experiments/

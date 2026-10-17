@@ -7,12 +7,17 @@ requires-python = ">=3.13"
 dependencies = [
     "aiolimiter>=1.2.1",
     "beautifulsoup4>=4.13.0",
+    "curl-cffi>=0.13.0",
     "httpx>=0.28.1",
     "rich>=15.0.0",
 ]
 
 [project.scripts]
 smallsat-dl = "smallsat_dl.cli:main"
+
+[project.optional-dependencies]
+# Compatibility with earlier installation commands; curl-cffi is now a base dependency.
+browser = []
 
 [dependency-groups]
 dev = [

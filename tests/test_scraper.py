@@ -60,7 +60,10 @@ EVENT_TWO_HTML = """
 </body></html>
 """
 
-EVENT_WITHOUT_PDF_HTML = "<html><body><p>No paper file</p></body></html>"
+EVENT_WITHOUT_PDF_HTML = """
+<html><head><meta name="bepress_citation_title" content="No paper file"></head>
+<body><p>No paper file</p></body></html>
+"""
 
 YEAR_2026_HTML = """
 <dl id="events-listing">
@@ -68,7 +71,7 @@ YEAR_2026_HTML = """
 </dl>
 """
 
-EMPTY_SESSION_HTML = "<table></table>"
+EMPTY_SESSION_HTML = '<table class="vcalendar"></table>'
 
 
 class FakeClient:
@@ -158,13 +161,13 @@ def test_parse_session_links_prefers_title_attribute():
     assert sessions[0].url == "https://digitalcommons.usu.edu/smallsat/2025/all2025/"
 
 
-def test_prefer_categorized_sessions_drops_aggregate_listing():
+def test_prefer_categorized_sessions_keeps_aggregate_listing_last():
     sessions = [
         Link("All 2025 Content", "https://example.test/all"),
         Link("Keynote 2025", "https://example.test/keynote"),
     ]
 
-    assert prefer_categorized_sessions(sessions) == [sessions[1]]
+    assert prefer_categorized_sessions(sessions) == [sessions[1], sessions[0]]
 
 
 def test_event_is_assigned_to_session_named_in_its_canonical_url():
@@ -440,6 +443,14 @@ def test_polite_delay_adds_up_to_full_random_jitter(monkeypatch):
     asyncio.run(downloader._polite_delay())
 
     assert bounds == [(0.25, 0.5)]
+
+
+def test_default_download_meter_has_no_burst_and_two_second_interval():
+    downloader = SmallSatDownloader(client=FakeClient({}), log=lambda _: None)
+
+    assert downloader.downloads_per_minute == 30
+    assert downloader._download_meter.max_rate == 1
+    assert downloader._download_meter.time_period == 2
 
 
 def test_download_meter_has_no_burst_and_fixed_rate():
